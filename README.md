@@ -16,6 +16,11 @@
 | 部署 | `//go:embed` 内嵌全部前端产物，一个二进制跑起来 |
 | 登录 | **增强而非门槛**。游客可用绝大部分功能，登录后收藏/已读/偏好跨设备同步 |
 | TTS | 服务端合成音频下发，客户端只播放。`TtsProvider` 抽象，可切 mock / 阿里 / 腾讯 |
+| 检索 | SQLite FTS5 全文检索（短查询自动回落 LIKE） |
+
+## 当前进度
+
+服务端与 Web 端已完成可运行版本（含管理后台），Android 端与独立采集器尚未开始 —— **ingest 接口已就绪但暂无写入方，是当前最大的功能缺口**。完整状态与后续计划见 [`docs/PROGRESS.md`](docs/PROGRESS.md)。
 
 ## 快速开始
 
@@ -58,6 +63,7 @@ docs/                    产品与架构文档
   PRD.md                 产品需求
   PRD-ACCOUNT.md         账号体系需求
   ARCHITECTURE.md        系统架构（19 章）
+  PROGRESS.md            开发进度与下一步计划
   api/openapi.yaml       API 契约（权威）
 server/                  Go 服务端
   cmd/eznews/            入口
@@ -70,7 +76,7 @@ web/                     Web 端
 
 ## 开发
 
-详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 与 [`docs/api/openapi.yaml`](docs/api/openapi.yaml)。
+详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 与 [`docs/api/openapi.yaml`](docs/api/openapi.yaml)。进度与下一步计划见 [`docs/PROGRESS.md`](docs/PROGRESS.md)。
 
 - **API 契约以 `docs/api/openapi.yaml` 为准**，实现与它冲突时以契约为准
 - 冒烟脚本：`server/smoke/run.sh`、`server/smoke/admin-e2e.sh`
