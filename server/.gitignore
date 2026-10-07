@@ -1,0 +1,14 @@
+# 冒烟测试运行时产物
+smoke/*.db
+smoke/*.db-wal
+smoke/*.db-shm
+smoke/jwt_secret
+smoke/audio/
+smoke/*.log
+smoke/result.txt
+smoke/smoke-cookies.txt
+smoke/dbg.*
+smoke/.smoke.lock/
+data/
+bin/
+config.yaml

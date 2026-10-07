@@ -1,0 +1,249 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ==========================================================================
+   设计令牌
+   --------------------------------------------------------------------------
+   颜色全部走 CSS 变量 + `rgb(var(--x) / <alpha-value>)`，
+   这样 Tailwind 的 `bg-surface` / `text-ink-muted` / `border-line` 等
+   在深浅色下自动切换，而不需要写两套 class 或 dark: 变体满天飞。
+
+   浅色：中性 slate 底 + 蓝色强调（MEMORY.md 设计偏好）
+   深色：同色系压暗，保持"中性 slate + 蓝色强调"不跑偏。
+   ========================================================================== */
+
+@layer base {
+  :root {
+    --ez-surface: 248 250 252; /* slate-50  */
+    --ez-surface-raised: 255 255 255; /* white   */
+    --ez-surface-sunken: 241 245 249; /* slate-100 */
+    --ez-line: 226 232 240; /* slate-200 */
+    --ez-ink: 15 23 42; /* slate-900  */
+    --ez-ink-muted: 71 85 105; /* slate-600 */
+    --ez-ink-faint: 148 163 184; /* slate-400 */
+    --ez-brand: 37 99 235; /* blue-600  */
+    --ez-brand-soft: 219 234 254; /* blue-100 */
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ez-surface: 2 6 23; /* slate-950 */
+      --ez-surface-raised: 15 23 42; /* slate-900  */
+      --ez-surface-sunken: 30 41 59; /* slate-800  */
+      --ez-line: 39 51 74; /* slate-700/60 */
+      --ez-ink: 241 245 249; /* slate-100 */
+      --ez-ink-muted: 148 163 184; /* slate-400 */
+      --ez-ink-faint: 100 116 139; /* slate-500 */
+      --ez-brand: 96 165 250; /* blue-400（深色下需提亮保证对比度） */
+      --ez-brand-soft: 30 58 138; /* blue-950 */
+    }
+  }
+
+  * {
+    @apply border-line;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-surface font-sans text-ink antialiased;
+    /* 中文正文的行高与字距：比英文更需要呼吸感 */
+    line-height: 1.65;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* 键盘可达性：只在 keyboard focus 时显示焦点环，鼠标点击不显示 */
+  :focus-visible {
+    @apply outline-none ring-2 ring-brand ring-offset-2 ring-offset-surface;
+  }
+
+  /* 深色下滚动条不刺眼 */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-slate-300 dark:bg-slate-700;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-slate-400 dark:bg-slate-600;
+  }
+}
+
+@layer components {
+  /* ---------- 卡片：内容块的标准容器 ---------- */
+  .ez-card {
+    @apply rounded-xl border border-line bg-surface-raised shadow-card;
+  }
+
+  .ez-card-interactive {
+    @apply cursor-pointer transition-all duration-150 hover:border-slate-300 hover:shadow-card-hover dark:hover:border-slate-600;
+  }
+
+  /* ---------- 按钮 ---------- */
+  .ez-btn {
+    @apply inline-flex select-none items-center justify-center gap-1.5 whitespace-nowrap rounded-lg
+           text-sm font-medium transition-colors duration-150
+           disabled:pointer-events-none disabled:opacity-50;
+  }
+
+  .ez-btn-md {
+    @apply h-9 px-3.5;
+  }
+  .ez-btn-sm {
+    @apply h-8 px-2.5 text-[13px];
+  }
+  .ez-btn-lg {
+    @apply h-11 px-5 text-[15px];
+  }
+
+  .ez-btn-primary {
+    @apply bg-brand text-white hover:bg-blue-700 dark:hover:bg-blue-300 dark:hover:text-slate-950;
+  }
+
+  .ez-btn-secondary {
+    @apply border border-line bg-surface-raised text-ink hover:bg-surface-sunken;
+  }
+
+  .ez-btn-ghost {
+    @apply text-ink-muted hover:bg-surface-sunken hover:text-ink;
+  }
+
+  .ez-btn-danger {
+    @apply bg-rose-600 text-white hover:bg-rose-700;
+  }
+
+  /* ---------- 表单 ---------- */
+  .ez-input {
+    @apply h-9 w-full rounded-lg border border-line bg-surface-raised px-3 text-sm text-ink
+           placeholder:text-ink-faint
+           focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand
+           disabled:opacity-60;
+  }
+
+  .ez-label {
+    @apply mb-1.5 block text-[13px] font-medium text-ink-muted;
+  }
+
+  /* ---------- 徽标 ---------- */
+  .ez-badge {
+    @apply inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium leading-none;
+  }
+
+  /* ---------- 骨架屏 ---------- */
+  .ez-skeleton {
+    @apply relative overflow-hidden rounded-md bg-slate-200 dark:bg-slate-800;
+  }
+  .ez-skeleton::after {
+    content: '';
+    @apply absolute inset-0 -translate-x-full;
+    background-image: linear-gradient(
+      90deg,
+      transparent,
+      rgb(255 255 255 / 0.45),
+      transparent
+    );
+    animation: shimmer 1.6s infinite;
+  }
+  .dark .ez-skeleton::after {
+    background-image: linear-gradient(
+      90deg,
+      transparent,
+      rgb(255 255 255 / 0.06),
+      transparent
+    );
+  }
+
+  /* ---------- 文章正文排版 ---------- */
+  .ez-prose {
+    @apply text-[15px] leading-[1.8] text-ink;
+  }
+  .ez-prose p {
+    @apply mb-4;
+  }
+  .ez-prose a {
+    @apply text-brand underline underline-offset-2 hover:no-underline;
+  }
+  .ez-prose ul,
+  .ez-prose ol {
+    @apply mb-4 ml-5 list-outside space-y-1;
+  }
+  .ez-prose ul {
+    @apply list-disc;
+  }
+  .ez-prose ol {
+    @apply list-decimal;
+  }
+  .ez-prose h2 {
+    @apply mb-2 mt-6 text-lg font-semibold;
+  }
+  .ez-prose h3 {
+    @apply mb-2 mt-5 text-base font-semibold;
+  }
+  .ez-prose blockquote {
+    @apply mb-4 border-l-4 border-brand-soft pl-4 text-ink-muted;
+  }
+  .ez-prose code {
+    @apply rounded bg-surface-sunken px-1 py-0.5 font-mono text-[13px];
+  }
+  .ez-prose pre {
+    @apply mb-4 overflow-x-auto rounded-lg bg-surface-sunken p-3 font-mono text-[13px];
+  }
+  .ez-prose pre code {
+    @apply bg-transparent p-0;
+  }
+  .ez-prose img {
+    @apply mb-4 rounded-lg;
+  }
+  .ez-prose hr {
+    @apply my-6 border-line;
+  }
+
+  /* ---------- 布局辅助 ---------- */
+  .ez-scrollbar-none {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .ez-scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* 首屏内容出现时的轻微入场（只做一次，不闪烁） */
+  .ez-enter {
+    @apply animate-slide-up;
+  }
+}
+
+@layer utilities {
+  .ez-line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .ez-line-clamp-3 {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}
+
+/* 尊重系统的"减少动效"设置（无障碍） */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

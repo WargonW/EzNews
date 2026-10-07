@@ -1,0 +1,90 @@
+# EZNews 冒烟测试配置（临时目录专用，不入版本库）
+# 关键差异 vs config.example.yaml：
+#  - tts.provider = mock（不依赖任何云密钥）
+#  - 独立 sqlite 库 / 独立 audio 目录 / 独立 jwt_secret
+#  - 端口 18080，避开 8080
+
+server:
+  addr: "127.0.0.1:18080"
+  readTimeout: 15s
+  writeTimeout: 60s
+  shutdownTimeout: 10s
+
+db:
+  path: ./smoke/eznews-smoke.db
+  busyTimeoutMs: 5000
+  cacheSizeKB: 4000
+  checkpointIntervalMin: 5
+
+auth:
+  apiKeys:
+    - id: smoke-crawler
+      key: smoke-key-do-not-use-in-prod
+  requireKeyForRead: false
+  jwtSecret: ""
+  jwtSecretPath: ./smoke/jwt_secret
+  accessTokenTTL: 2h
+  refreshTokenTTL: 720h
+  registrationEnabled: true
+  argon2:
+    memory: 12288
+    time: 1
+    threads: 1
+  argon2MaxConcurrency: 2
+  argon2QueueTimeoutMs: 3000
+  loginLimitPerUser: "50/m"
+  loginLimitPerIP: "200/m"
+  lockoutDuration: 15m
+  refreshReuseGraceSec: 60
+  refreshReplayGuardMax: 10
+  refreshCookie: true
+  refreshTokenInBody: true
+  refreshCookiePath: /api/v1/auth
+
+ingest:
+  maxBatchItems: 200
+  maxBodyBytes: 4194304
+  storeContent: false
+  autoCreateSource: false        # 显式建源，才能验证 SOURCE_NOT_FOUND 分支
+  defaultTimezone: UTC
+  trackParamBlacklist: ["utm_*", "spm", "from", "ref"]
+
+ratelimit:
+  globalRps: 500
+  globalBurst: 1000
+  perKeyRps: 200
+  perKeyBurst: 400
+
+tts:
+  provider: mock
+  fallbackProvider: ""
+  credentials: {}
+  defaultVoice: "mock-voice"
+  defaultSpeed: 1.0
+  format: mp3
+  sampleRate: 16000
+  maxChars: 800
+  concurrency: 2
+  queueSize: 64
+  maxRetries: 1
+  timeout: 20s
+
+audio:
+  dir: ./smoke/audio
+  maxTotalBytes: 67108864
+  maxAgeDays: 1
+  accessFlushIntervalSec: 5
+
+retention:
+  enabled: false
+  days: 90
+
+janitor:
+  intervalMin: 60
+
+search:
+  enableFts: true
+
+log:
+  level: info
+  format: json

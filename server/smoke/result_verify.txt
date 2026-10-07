@@ -1,0 +1,12 @@
+binary: /d/dev/softwares/eznews-data/bin/eznews.exe
+server pid=15717
+SERVER DIED DURING STARTUP
+{"time":"2026-10-06T20:44:46.9486531+08:00","level":"INFO","msg":"已生成并持久化新的 JWT 密钥","path":"D:\\dev\\project\\EZ\\EZNews\\server\\smoke\\jwt_secret"}
+{"time":"2026-10-06T20:44:47.0824602+08:00","level":"INFO","msg":"迁移已应用","name":"001_init.sql","version":1}
+{"time":"2026-10-06T20:44:47.0840102+08:00","level":"INFO","msg":"迁移已应用","name":"002_account.sql","version":2}
+{"time":"2026-10-06T20:44:47.0845251+08:00","level":"INFO","msg":"迁移已应用","name":"003_fts.sql","version":3}
+{"time":"2026-10-06T20:44:47.085041+08:00","level":"INFO","msg":"迁移已应用","name":"004_seed.sql","version":4}
+{"time":"2026-10-06T20:44:47.0855782+08:00","level":"WARN","msg":"云 TTS 凭据未配置（EZNEWS_TTS_SECRET_ID / _SECRET_KEY）"}
+{"time":"2026-10-06T20:44:47.0855782+08:00","level":"INFO","msg":"TTS worker pool 已启动","workers":2,"queueSize":64}
+{"time":"2026-10-06T20:44:47.0860909+08:00","level":"INFO","msg":"Janitor 已启动","interval":3600000000000}
+{"time":"2026-10-06T20:44:47.110387+08:00","level":"INFO","msg":"HTTP 服务器已启动","addr":"127.0.0.1:18080","version":"dev","articles":0}

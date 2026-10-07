@@ -1,0 +1,46 @@
+# ── 运行时数据与密钥（绝不入库）─────────────────────────────
+# SQLite 库及其 WAL/SHM 旁文件：含用户表与 Argon2 密码哈希
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# JWT 签名密钥：泄露 = 任何人可伪造任意用户（含管理员）的令牌
+jwt_secret
+jwt_secret*
+*.key
+*.pem
+
+# 本地/验证/联调用真实配置（含 apiKeys、jwtSecret 等）
+config.yaml
+config.local.yaml
+config.dev.yaml
+config.prod.yaml
+.verify/
+data/
+
+# ── 日志与产物 ────────────────────────────────────────────
+*.log
+server/bin/
+
+# ── 验证与截图产物（本地用，不入库）────────────────────────
+.shots/
+
+# ── 编辑器 / 系统 ────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.sw?
+
+# ── 构建缓存 ─────────────────────────────────────────────
+coverage/
+
+# ── 非项目内容 ───────────────────────────────────────────
+# 工具内置技能包（与本项目无关，勿随仓库分发）
+ardot-batch-edit-operations-guide.zip
+
+# 开发过程中的本地工作记录（含环境细节与临时结论，非项目源码）
+.workbuddy/

@@ -1,0 +1,2543 @@
+openapi: 3.1.0
+
+info:
+  title: EZNews API
+  version: 1.0.0
+  summary: 外部采集器写入（Ingest）+ Web/Android 读取查询 + TTS 语音合成
+  description: |
+    EZNews 是轻量、可自托管的新闻聚合与语音播报服务。
+
+    ## 系统边界
+    - **服务端不采集**：不爬虫、不解析 RSS、不抓网页。文章由**外部采集器**通过本文件的 `ingest` 接口写入。
+    - **无推送**：无 WebSocket / SSE / 厂商推送。客户端主动 REST 拉取，配合 `cursor` 游标做增量同步。
+    - **TTS 服务端合成**：客户端只播放音频，不做端侧朗读。
+
+    ## 鉴权
+    - 写接口（`POST /api/v1/ingest/*`）**必须**携带 `X-Api-Key` 请求头。
+    - 读接口默认不鉴权，可由服务端配置 `auth.requireKeyForRead` 开启。
+
+    ## 幂等
+    `ingest` 接口幂等：以 `sourceId+externalId` 或规范化 `url` 为去重键；
+    内容无变化时回执 `skipped` 且**不刷新 `updated_at`**（保证增量游标纯净）。
+    因此对 `429 / 500 / 503` 可安全重试。
+
+    ## 账号体系（v1.1）
+    形态为「**游客可用 + 可选登录**」双态：**登录是增强，不是门槛**。
+
+    - 业务接口（文章/源/音频）对游客**全部开放**，永不返回"需要登录"。
+    - 仅 `/api/v1/me/**` 需要 Bearer Access Token。
+    - Access Token = JWT(HS256)，2 小时，**服务端本地验签、高频路径零 DB 查询**。
+    - Refresh Token = 32 字节不透明随机串，30 天滑动续期 + 轮换 + reuse 检测；库内仅存 SHA-256 哈希。
+    - 改密/全局登出靠 `token_version` 递增，**无 Redis 黑名单**。
+    - 登录后客户端自动调用 `POST /api/v1/me/merge` 幂等合并游客本地数据（无弹窗、无打断）。
+    - **客户端 401 处理必须实现 single-flight（DEC-10，实现强制项）**：并发 401 只触发一次 refresh，其余请求挂起等待，否则 refresh token 会被并发轮换导致互踢。
+    - **Web 官方仅支持同源部署（DEC-12）**：同域反代 + `httpOnly` Cookie。跨域部署不为官方支持（refreshToken 降级 localStorage，XSS 风险由部署者自担），不为其设计额外跨域认证方案。
+
+    ## 时间格式
+    所有时间字段以 ISO 8601 UTC（`YYYY-MM-DDTHH:mm:ss.sssZ`）传输；服务端内部以 epoch 毫秒存储。
+
+  contact:
+    name: EZNews Project
+
+servers:
+  - url: http://localhost:8080
+    description: 本地自托管默认地址
+  - url: https://{host}
+    description: 生产（由部署层提供 HTTPS）
+    variables:
+      host:
+        default: eznews.example.com
+
+tags:
+  - name: ingest
+    description: 外部采集器写入接口（★ 跨系统契约，已冻结）
+  - name: articles
+    description: 文章查询
+  - name: sources
+    description: 新闻源管理
+  - name: audio
+    description: TTS 合成与音频获取
+  - name: ops
+    description: 健康检查与指标
+  - name: auth
+    description: 账号注册 / 登录 / 刷新 / 登出（v1.1）
+  - name: me
+    description: 登录后数据与同步（v1.1，需 Bearer Token）
+  - name: admin
+    description: |
+      管理后台（v1.2，需 Bearer Token 且账号为未停用的 admin）。
+
+      权限判定每次请求都查库，不读 JWT 里的角色声明 ——
+      因此管理员被降权或停用后，其尚未过期的 token 立即失去后台访问权。
+      破坏性操作受「最后一个可用管理员」守卫保护。
+  - name: admin
+    description: |
+      管理后台（v1.2，需 Bearer Token 且账号为**未停用的 admin**）。
+
+      权限判定每次请求都查库，不读 JWT 里的角色声明 ——
+      因此管理员被降权或停用后，其尚未过期的 token **立即**失去后台访问权。
+      破坏性操作受「最后一个可用管理员」守卫保护（见 AdminUserDTO.self 与能力位）。
+
+security: []
+
+paths:
+
+  # ==================== Ingest ====================
+
+  /api/v1/ingest/articles:
+    post:
+      tags: [ingest]
+      operationId: ingestArticle
+      summary: 提交单篇文章
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArticleIngestItem'
+            examples:
+              minimal:
+                summary: 最小必填示例
+                value:
+                  sourceKey: sspai
+                  url: https://sspai.com/post/91234
+                  title: 新一代折叠屏手机发布，铰链寿命提升至 40 万次
+                  publishedAt: '2025-10-06T09:12:30+08:00'
+      responses:
+        '200':
+          description: 已接收并处理（业务级失败通过 data.results 返回）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/IngestReceipt'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  /api/v1/ingest/articles/batch:
+    post:
+      tags: [ingest]
+      operationId: ingestArticleBatch
+      summary: 批量提交文章（默认上限 200 篇/请求）
+      description: |
+        单事务批写，逐条判定回执。整批请求失败（鉴权/校验/限流/体量）返回非 2xx；
+        单条业务失败不影响其他条目，体现在 `data.results` 中。
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: verbose
+          in: query
+          required: false
+          description: none=results 只含 failed 明细；all=返回全部条目（含 articleId）
+          schema:
+            type: string
+            enum: [none, all]
+            default: none
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  items:
+                    $ref: '#/components/schemas/ArticleIngestItem'
+            examples:
+              batch:
+                summary: 批量示例
+                value:
+                  items:
+                    - sourceKey: sspai
+                      externalId: 'sspai:91234'
+                      url: https://sspai.com/post/91234?utm_source=feed
+                      title: 新一代折叠屏手机发布
+                      summary: 厂商公布新一代折叠屏，铰链寿命提升至 40 万次……
+                      category: tech
+                      author: 少数派编辑部
+                      imageUrl: https://cdn.sspai.com/2025/10/cover.jpg
+                      publishedAt: '2025-10-06T09:12:30+08:00'
+                      tags: ['折叠屏', '手机']
+                    - sourceId: 7
+                      url: https://example.com/news/abc
+                      title: 标题二
+                      publishedAt: '2025-10-06T10:00:00Z'
+      responses:
+        '200':
+          description: 已接收并处理
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/IngestReceipt'
+              examples:
+                mixed:
+                  summary: 混合回执
+                  value:
+                    code: OK
+                    message: ok
+                    requestId: V1StGXR8_Z5jdHi6B-myT
+                    data:
+                      received: 2
+                      created: 1
+                      updated: 0
+                      skipped: 0
+                      failed: 1
+                      durationMs: 12
+                      results:
+                        - index: 1
+                          status: failed
+                          reason: SOURCE_NOT_FOUND
+                          message: '未找到 sourceId=7'
+                          articleId: null
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  # ==================== Articles ====================
+
+  /api/v1/articles:
+    get:
+      tags: [articles]
+      operationId: listArticles
+      summary: 文章列表（首屏/翻页 或 增量同步）
+      description: |
+        **两种模式互斥**：
+        - 不传 `cursor` → **首屏/翻页模式**：按 `published_at DESC, id DESC`，用 `pageCursor` 翻页，响应额外返回 `syncCursor`（服务端水位）。
+        - 传 `cursor` → **增量同步模式**：按 `updated_at ASC, id ASC`，返回该水位之后发生变化的文章，用 `nextCursor` 继续，`hasMore=false` 结束。
+
+        客户端算法：首次请求不带 cursor → 保存 `syncCursor`；之后带 `cursor=<syncCursor>` 循环拉取直到 `hasMore=false`，
+        按 `id` 本地合并去重，并更新 `syncCursor`。
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/PageCursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: sourceId
+          in: query
+          schema: { type: integer, format: int64 }
+          description: 按源筛选（与 sourceKey 二选一）
+        - name: sourceKey
+          in: query
+          schema: { type: string }
+          description: 按源业务键筛选
+        - name: category
+          in: query
+          schema: { $ref: '#/components/schemas/Category' }
+        - name: from
+          in: query
+          schema: { type: string }
+          description: published_at 下界（ISO 8601 或 epoch 毫秒）
+        - name: to
+          in: query
+          schema: { type: string }
+          description: published_at 上界
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 64 }
+          description: 关键词搜索（title/summary，P1）
+        - name: includeDisabled
+          in: query
+          schema: { type: boolean, default: false }
+          description: 是否包含已停用源的文章
+        - name: withAudio
+          in: query
+          schema: { type: boolean, default: false }
+          description: 附带每篇文章在默认音色下的合成状态（省去 N 次请求）
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ArticlePage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /api/v1/articles/{id}:
+    get:
+      tags: [articles]
+      operationId: getArticle
+      summary: 文章详情
+      parameters:
+        - $ref: '#/components/parameters/ArticleId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ArticleDTO'
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/articles/{id}/audio:
+    get:
+      tags: [audio]
+      operationId: getArticleAudio
+      summary: 查询该文章已合成的音频（缓存直查，不触发合成）
+      parameters:
+        - $ref: '#/components/parameters/ArticleId'
+        - name: voice
+          in: query
+          schema: { type: string }
+          description: 音色，缺省用服务端默认音色
+        - name: speed
+          in: query
+          schema: { type: number, format: float, minimum: 0.5, maximum: 2.0 }
+          description: 语速，缺省用服务端默认语速
+      responses:
+        '200':
+          description: 命中缓存
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AudioDTO'
+        '404':
+          description: 尚未合成，需先 POST /api/v1/audio/tasks
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  /api/v1/categories:
+    get:
+      tags: [articles]
+      operationId: listCategories
+      summary: 分类枚举及文章计数
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                key: { $ref: '#/components/schemas/Category' }
+                                label: { type: string }
+                                count: { type: integer }
+
+  # ==================== Sources ====================
+
+  /api/v1/sources:
+    get:
+      tags: [sources]
+      operationId: listSources
+      summary: 源列表（含默认源与自定义源及其启停状态、建议采集间隔）
+      parameters:
+        - name: includeDisabled
+          in: query
+          schema: { type: boolean, default: true }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items: { $ref: '#/components/schemas/SourceDTO' }
+    post:
+      tags: [sources]
+      operationId: createSource
+      summary: 新增自定义源
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceInput' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SourceDTO' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/sources/{id}:
+    put:
+      tags: [sources]
+      operationId: updateSource
+      summary: 编辑源（默认源仅允许修改 enabled）
+      parameters:
+        - $ref: '#/components/parameters/SourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceInput' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SourceDTO' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [sources]
+      operationId: deleteSource
+      summary: 删除自定义源（默认源不可删除 → 409）
+      parameters:
+        - $ref: '#/components/parameters/SourceId'
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/sources/{id}/enabled:
+    patch:
+      tags: [sources]
+      operationId: setSourceEnabled
+      summary: 启用/停用源（停用后其文章默认不进入列表）
+      parameters:
+        - $ref: '#/components/parameters/SourceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SourceDTO' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==================== Audio / TTS ====================
+
+  /api/v1/audio/tasks:
+    post:
+      tags: [audio]
+      operationId: createAudioTask
+      summary: 提交合成任务（按 articleId + voice + speed，命中缓存直接返回 ready）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [articleId]
+              properties:
+                articleId: { type: integer, format: int64 }
+                voice: { type: string, description: 音色，缺省用服务端默认 }
+                speed: { type: number, format: float, minimum: 0.5, maximum: 2.0, default: 1.0 }
+      responses:
+        '200':
+          description: 缓存命中，已就绪
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AudioTaskDTO' }
+        '202':
+          description: 已入队（pending / processing）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AudioTaskDTO' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429':
+          description: 合成队列已满
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  /api/v1/audio/tasks/{taskId}:
+    get:
+      tags: [audio]
+      operationId: getAudioTask
+      summary: 查询合成状态（客户端轮询：1s → 2s → 4s 退避，上限 30s）
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AudioTaskDTO' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/audio/tasks/{taskId}/retry:
+    post:
+      tags: [audio]
+      operationId: retryAudioTask
+      summary: 重试失败任务（重置 retry_count 并重新入队）
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '202':
+          description: 已重新入队
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AudioTaskDTO' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/audio/{audioId}:
+    get:
+      tags: [audio]
+      operationId: getAudioFile
+      summary: 获取音频文件（支持 HTTP Range 断点续传）
+      parameters:
+        - name: audioId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: 完整音频
+          headers:
+            Accept-Ranges: { schema: { type: string }, example: bytes }
+            ETag: { schema: { type: string } }
+            Cache-Control: { schema: { type: string }, example: 'public, max-age=31536000, immutable' }
+          content:
+            audio/mpeg:
+              schema: { type: string, format: binary }
+        '206':
+          description: 分片音频（Range 请求）
+          headers:
+            Content-Range: { schema: { type: string }, example: 'bytes 0-1023/204800' }
+          content:
+            audio/mpeg:
+              schema: { type: string, format: binary }
+        '304':
+          description: 未修改（If-None-Match / If-Modified-Since 命中）
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==================== Ops ====================
+
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: healthz
+      summary: 存活探针（不查 DB）
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  uptimeSec: { type: integer }
+                  version: { type: string }
+
+  /readyz:
+    get:
+      tags: [ops]
+      operationId: readyz
+      summary: 就绪探针（执行 SELECT 1 并检查 WAL 可写）
+      responses:
+        '200':
+          description: 就绪
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  db: { type: string, example: ok }
+        '503':
+          description: 未就绪
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: unavailable }
+                  db: { type: string }
+
+  /metrics:
+    get:
+      tags: [ops]
+      operationId: metrics
+      summary: 简易 JSON 指标（P1）
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  articles: { type: integer }
+                  ingestedToday: { type: integer }
+                  ttsSynthesized: { type: integer }
+                  ttsCacheHit: { type: integer }
+                  ttsFailed: { type: integer }
+                  audioBytes: { type: integer }
+                  goroutines: { type: integer }
+                  heapAllocBytes: { type: integer }
+
+  # ==================== Auth（v1.1） ====================
+
+  /api/v1/auth/register:
+    post:
+      tags: [auth]
+      operationId: register
+      summary: 注册（游客可调用）
+      description: |
+        用户名 + 密码；email 选填且不验证。密码以 Argon2id（m=19MiB, t=2, p=1，PHC 格式）存储。
+        `auth.registrationEnabled=false` 时返回 403。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, minLength: 3, maxLength: 32 }
+                password: { type: string, minLength: 8, maxLength: 128 }
+                email: { type: [string, 'null'], format: email }
+                deviceName: { type: [string, 'null'], maxLength: 64 }
+                clientId: { type: [string, 'null'], maxLength: 64 }
+      responses:
+        '201':
+          description: 注册成功并已建立会话（客户端随后应自动发起一次 /me/merge）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/TokenResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403':
+          description: 注册已关闭（auth.registrationEnabled=false）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceBusy' }
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: 登录（游客可调用）
+      description: |
+        失败统一返回 `401 INVALID_CREDENTIALS`（不区分"用户不存在"与"密码错误"）。
+        登录路径受进程内限流保护（per-username 5/min、per-IP 20/min）与 Argon2id 并发信号量。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+                deviceName: { type: [string, 'null'], maxLength: 64 }
+                clientId: { type: [string, 'null'], maxLength: 64 }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/TokenResponse' }
+        '401':
+          description: 凭证无效
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+              example: { code: INVALID_CREDENTIALS, message: 用户名或密码错误 }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceBusy' }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      operationId: refresh
+      summary: 用 refreshToken 轮换换取新 accessToken
+      description: |
+        Web 同源部署模式下 refreshToken 由 `httpOnly` Cookie 自动携带，请求体可为空。
+
+        **轮换语义**：每次刷新作废旧串并下发新串（旧 hash 挪入 `prev_refresh_token_hash`，保留一代）。
+
+        **reuse 检测为两级判定（DEC-7）**：
+        - ① **宽限重放** —— 同一 refresh token 在 `auth.refresh_reuse_grace_sec`（默认 **60 秒**）内
+          且**同一 `client_id`** 再次出现 → 判定为弱网重试，服务端**再执行一次轮换并幂等下发新对**，
+          **不惩罚用户**（移动端弱网场景保护）。
+        - ② **疑似泄露** —— 超出宽限窗口，或**不同 `client_id`** 使用了同一旧 token →
+          撤销该用户**全部** session + `token_version+1` + 强制重新登录（OWASP / RFC 6819 建议）。
+
+        > 服务端只存 token 的 SHA-256 哈希，无法还原旧明文，因此宽限重放的实现方式是"再轮换一次"，
+        > 效果等价于返回已轮换后的凭据。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken: { type: [string, 'null'] }
+                clientId:
+                  type: [string, 'null']
+                  maxLength: 64
+                  description: |
+                    发起本次刷新的客户端标识（与登录/注册时同一 `clientId`）。
+
+                    **DEC-7 宽限重放判定依赖本字段**：同一 refresh token 在宽限窗口内再次出现时，
+                    服务端会比对 `client_id` ——
+                    - **相同** `clientId` → 判为弱网重试，再执行一次轮换并幂等下发新对，**不惩罚用户**；
+                    - **不同** `clientId` → 判为疑似泄露，撤销该用户**全部** session + `token_version+1`。
+
+                    因此客户端**必须**在每次刷新时携带与登录时一致的 `clientId`，
+                    否则弱网重试会被误判为泄露，导致该账号所有设备被强制登出。
+                    缺省（null）时按"无法确认同源"处理，不享受宽限豁免。
+                deviceName:
+                  type: [string, 'null']
+                  maxLength: 64
+                  description: 可选的设备名，用于会话列表展示。
+      responses:
+        '200':
+          description: 刷新成功（已轮换）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/TokenResponse' }
+        '401':
+          description: refreshToken 无效/过期/已撤销（reuse 命中则全部会话被撤销）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+              example: { code: UNAUTHORIZED, message: 登录已失效，请重新登录 }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: 登出，销毁当前 session
+      description: |
+        优先按 Access Token 的 `sid` 声明定位并销毁会话（DEC-14），因此**不依赖 refreshToken 是否送达**——
+        无论服务端如何配置 refreshCookie / refreshTokenInBody，登出都一定生效。
+        请求体中的 refreshToken 仅作为无 `sid` 老 token 的回退路径；两者都缺失时仍返回 204（仅清客户端态），并记 warn 日志。
+        删除前必须校验 session.user_id 等于 token 的 sub。
+
+        幂等且**不泄露会话存在性**：即使该会话行已不存在（已过期 / 已被 reuse 处置撤销）也返回 `204`，不报错。
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken: { type: [string, 'null'] }
+      responses:
+        '204':
+          description: 已登出（无响应体；幂等，不泄露会话是否存在）
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ==================== Me（v1.1，全部需登录） ====================
+
+  /api/v1/me:
+    get:
+      tags: [me]
+      operationId: getMe
+      summary: 当前账号基本信息
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/UserDTO' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      tags: [me]
+      operationId: deleteMe
+      summary: 注销账号（需密码二次确认；不可逆）
+      security: [{ BearerAuth: [] }]
+      description: |
+        **DEC-8 四条硬约束**：
+        1. 必须携带**当前密码**二次确认（防误操作与 CSRF），校验失败 → `401 INVALID_CREDENTIALS`；
+        2. 级联删除范围 = `user` + `session` + `user_favorite` + `user_read` + `user_preference` + `merge_log`，
+           **绝不触碰** `article` / `source` / `audio` 等全局数据；
+        3. 成功返回 **`204 No Content`**，客户端清本地凭证与同步快照、回到游客态；
+        4. **不可逆**，服务端无软删除与恢复路径。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, description: 当前密码（二次确认） }
+      responses:
+        '204':
+          description: 已注销（无响应体）
+        '401':
+          description: 密码校验失败或 token 无效
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+              example: { code: INVALID_CREDENTIALS, message: 密码错误，注销已取消 }
+
+  /api/v1/me/password:
+    patch:
+      tags: [me]
+      operationId: changePassword
+      summary: 修改密码（触发 token_version+1，使全部已签发 Access Token 失效）
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [oldPassword, newPassword]
+              properties:
+                oldPassword: { type: string }
+                newPassword: { type: string, minLength: 8, maxLength: 128 }
+      responses:
+        '200':
+          description: 已修改，响应同时下发新的一对 token
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/TokenResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/me/merge:
+    post:
+      tags: [me]
+      operationId: mergeGuestData
+      summary: '★ 游客数据幂等合并（Merge Policy v1）'
+      security: [{ BearerAuth: [] }]
+      description: |
+        登录后由客户端**自动**发起一次（无需用户确认、无弹窗）。
+
+        **幂等**：键 = `(client_id, nonce)`。命中 `merge_log` 时**直接回放历史结果、零写入**（`replayed=true`）。
+
+        **冲突消解**：
+        - 收藏 / 已读 = **并集** + **LWW(`updated_at`) 较新者胜出** + **墓碑 `deleted`**（防止本地取消的收藏被旧数据复活）
+        - 偏好 = **整包 KV**，**服务端有值以服务端为准**；无值才写入本地值作初始值
+
+        **失败处理**：合并失败不影响登录态，客户端静默降级本地态并退避重试。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MergeRequest' }
+      responses:
+        '200':
+          description: 合并完成（或命中幂等直接回放）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MergeResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+
+  /api/v1/me/favorites:
+    get:
+      tags: [me]
+      operationId: listFavorites
+      summary: 收藏列表（支持 since 增量游标，语义与文章列表一致）
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/StateLimit'
+        - $ref: '#/components/parameters/WithArticles'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/StatePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [me]
+      operationId: setFavorite
+      summary: 收藏 / 取消收藏（取消写墓碑 deleted=true，非物理删除）
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [articleId]
+              properties:
+                articleId: { type: integer, format: int64 }
+                deleted: { type: boolean, default: false, description: true=取消收藏（墓碑） }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/me/reads:
+    get:
+      tags: [me]
+      operationId: listReads
+      summary: 已读列表（支持 since 增量游标）
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/StateLimit'
+        - $ref: '#/components/parameters/WithArticles'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/StatePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [me]
+      operationId: setRead
+      summary: 标记已读 / 取消已读（取消写墓碑）
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [articleId]
+              properties:
+                articleId: { type: integer, format: int64 }
+                deleted: { type: boolean, default: false }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/me/state/batch:
+    post:
+      tags: [me]
+      operationId: batchSetState
+      summary: '★ 批量标记已读 / 收藏（整批原子提交，单次上限 500 条）'
+      security: [{ BearerAuth: [] }]
+      description: |
+        阅读列表「全部标记已读」这类**一次操作多条**的场景。客户端本地攒够一批
+        （最多 500 条）一次提交即可，无需串行发 N 次 `POST /me/reads`。
+
+        **原子性（客户端可安全重试的唯一依据）**：
+        整个批次在**同一个数据库写事务**内提交。中途任一条失败 → **整批回滚**，
+        库里不会留下任何一行半成品。
+
+        因此本端点**只有两种结果**，不存在「部分成功」：
+        - `200`：`readsChanged` / `favoritesChanged` 两条计数所对应的行**已全部落库**；
+        - 4xx / 5xx：**整批一条都没生效**，客户端可原样重试。
+
+        **幂等**：重放整个批次是安全的（唯一索引 + `ON CONFLICT DO UPDATE`），
+        不会产生重复行，也不会改变最终状态。
+
+        **前置校验**：任一 `articleId` 不存在 → 整批 `404 NOT_FOUND`，
+        此时同样一条都没写入。客户端不必自己区分「部分 id 无效」。
+
+        `favorite` 为 `null` / 省略 = **本批次不改动收藏**（只改已读）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BatchStateRequest' }
+      responses:
+        '200':
+          description: 整批已提交
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/BatchStateResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+
+  /api/v1/me/preferences:
+    get:
+      tags: [me]
+      operationId: getPreferences
+      summary: 拉取偏好 KV 全量
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          preferences: { $ref: '#/components/schemas/PreferenceKV' }
+                          updatedAt: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [me]
+      operationId: putPreferences
+      summary: 整包写入偏好 KV（服务端为准，整包覆盖，天然幂等）
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [preferences]
+              properties:
+                preferences: { $ref: '#/components/schemas/PreferenceKV' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/me/sessions:
+    get:
+      tags: [me]
+      operationId: listSessions
+      summary: 当前账号的活跃会话列表（P1）
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          items:
+                            type: array
+                            items: { $ref: '#/components/schemas/SessionDTO' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/me/sessions/{id}:
+    delete:
+      tags: [me]
+      operationId: revokeSession
+      summary: 踢下线指定会话（P2 预留）
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: 已撤销
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  # ==================== Admin（后台管理） ====================
+  #
+  # 所有 /api/v1/admin/** 端点都需要 Bearer 令牌 **且当前账号必须是未被停用的管理员**。
+  # 权限判定**每次查库**，不读 JWT 里的声明：管理员被降权或停用后，手里这张未过期的
+  # token 会**立刻**失效（下一次请求即 403），无需等它自然过期。
+  #
+  # 401 与 403 的界限（客户端必须区别处理）：
+  #   - 401 UNAUTHORIZED / TOKEN_EXPIRED → 身份问题，去 refresh 然后重放。
+  #   - 403 FORBIDDEN / ACCOUNT_DISABLED → 权限不足或账号已停用，**立即跳出登录态**，
+  #     不要重试。混为一谈会让被降权的人陷入静默重试循环。
+
+  /api/v1/admin/overview:
+    get:
+      tags: [admin]
+      operationId: adminOverview
+      summary: 后台概览（全站计数与运行时指标）
+      description: |
+        返回用户/文章/新闻源/语音/会话的核心计数，以及进程运行时信息。
+
+        全部是聚合查询，单次快照；`generatedAt` 是本快照的服务端 Unix 秒时间戳。
+        不要把这份数据当作强一致的实时监控 —— 它只服务于后台仪表盘的"大概多少"。
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminOverviewDTO' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  /api/v1/admin/users:
+    get:
+      tags: [admin]
+      operationId: adminListUsers
+      summary: 用户列表（分页 / 搜索 / 角色筛选）
+      description: |
+        keyset 分页：`cursor` 取上一页最后一项的 `id`，语义是 `id < cursor`，因此删除
+        中间行不会造成翻页重复/漏项。
+
+        - `role` 只接受 `user` / `admin`，**其他值返回 400 而不是静默当空列表**。
+        - `q` 同时匹配 `username` 与 `email`，`%` `_` 等 LIKE 通配符会被转义 ——
+          搜索是"包含"，不是 glob。
+        - `limit` 取值 1..100，**越界返回 400 而不是静默截断到边界值** ——
+          静默截断会让客户端以为自己拿到了请求的数量。
+        - `cursor` 非法（非整数）同样返回 400；省略则从第一页开始。
+        - `total` 是**整个筛选条件的总数**，与游标无关 —— 翻到第二页时总数不会变小。
+      parameters:
+        - name: q
+          in: query
+          description: 用户名或邮箱模糊匹配（通配符被转义）
+          schema: { type: string }
+        - name: role
+          in: query
+          description: 角色筛选
+          schema: { type: string, enum: [user, admin] }
+        - name: limit
+          in: query
+          description: 每页条数，1..100，默认 20
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: cursor
+          in: query
+          description: 上一页最后一项的 id；省略或非法值都从第一页开始
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminUserListDTO' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+    post:
+      tags: [admin]
+      operationId: adminCreateUser
+      summary: 管理员代建账号
+      description: |
+        与自助注册 (`/api/v1/auth/register`) 的区别：
+
+        - **不受** `registrationEnabled` 开关限制 —— 注册关闭时后台仍必须能开号，
+          否则"注册关了自己也进不来"。
+        - 可以指定初始 `role`（含 `admin`）。自助注册只能产出 `user`。
+        - **不为新账号创建会话、不签发令牌** —— 代建账号 ≠ 代登录，避免管理员
+          拿着别人的 token 浑然不觉。
+
+        密码强度沿用全局策略（与自助注册同一套校验，不重抄一份）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminCreateUserInput' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminUserDTO' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  /api/v1/admin/users/{id}:
+    get:
+      tags: [admin]
+      operationId: adminGetUser
+      summary: 用户详情
+      description: |
+        返回单个用户的档案、计数与**能力位**。
+
+        目标不存在时返回 404，**不会**用"返回空对象"敷衍 —— 静默失败让前端只能
+        渲染一个空白面板，排查成本高得多。
+      parameters:
+        - $ref: '#/components/parameters/AdminUserId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminUserDTO' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+    delete:
+      tags: [admin]
+      operationId: adminDeleteUser
+      summary: 删除账户
+      description: |
+        级联清理该用户的 session / user_favorite / user_read / user_preference /
+        merge_log，**刻意保留**其 article 与 source —— 那些属于公共内容资产，
+        删一个人不该把大家订阅的源一起带走。
+
+        删除会连带失效其全部会话（级联删除 session 表即成）。
+
+        受「最后一个可用管理员」守卫与"不能删除自己"双重限制，违反返回 409。
+      parameters:
+        - $ref: '#/components/parameters/AdminUserId'
+      responses:
+        '204': { description: 已删除，无响应体 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  /api/v1/admin/users/{id}/role:
+    patch:
+      tags: [admin]
+      operationId: adminSetUserRole
+      summary: 修改用户角色
+      description: |
+        反复提交相同角色会幂等成功（重复 UPDATE 影响 0 行不报错）："再点一次"是人之
+        常情，而幂等写没有副作用风险，因此这里不做去重也不要求幂等键。
+
+        违反以下任一条返回 409：
+
+        - 目标是系统最后一个**可用**（`role=admin` 且未被停用）管理员 → 降级后无人能进后台；
+        - 目标是自己 → 管理员把自己降成普通用户同属自毁行为。
+
+        注意判据是"目标本人是管理员且存量只剩他一个"，而不是单纯比较 `admins <= 1`：
+        把一个普通用户降级，跟管理员存量毫无关系，不该被拦。
+      parameters:
+        - $ref: '#/components/parameters/AdminUserId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              additionalProperties: false
+              properties:
+                role:
+                  type: string
+                  enum: [user, admin]
+                  description: 目标角色，其它值返回 400
+      responses:
+        '200':
+          description: OK，返回变更后的用户（含重算的能力位）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminUserDTO' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  /api/v1/admin/users/{id}/disabled:
+    patch:
+      tags: [admin]
+      operationId: adminSetUserDisabled
+      summary: 停用 / 启用账户
+      description: |
+        `disabled` **必填**。这是 `*bool` 指针语义 —— 存在合法的"显式 false"（启用），
+        用裸 bool 会把"漏传字段"当成"要停用"，方向反了且不可逆。
+
+        停用会**连带吊销该用户的全部会话**，因此即时生效；启用则**刻意不动**会话 ——
+        恢复账号不等于替他登录。
+
+        停用必须在服务端持久化而不是只吊销会话：否则用户再登一次就进来了。
+        拦截点有三处 —— access token 校验、登录、refresh。
+      parameters:
+        - $ref: '#/components/parameters/AdminUserId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [disabled]
+              additionalProperties: false
+              properties:
+                disabled:
+                  type: boolean
+                  description: true 停用 / false 启用；缺字段返回 400
+      responses:
+        '200':
+          description: OK，返回变更后的用户（含重算的能力位）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminUserDTO' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  /api/v1/admin/users/{id}/sessions/revoke-all:
+    post:
+      tags: [admin]
+      operationId: adminRevokeAllSessions
+      summary: 吊销该用户的全部会话（踢下线）
+      description: |
+        用于"疑似被盗 / 换设备 / 疑似共享账号"的场景，比停用温和：账号仍可用，
+        但必须重新登录。
+
+        允许对**别人**执行；对自己执行没有意义（自己正握着当前会话，吊销只会把自己
+        踢掉），不限 "self" 之外的额外组合。重复调用安全：`revoked` 第二次通常为 0。
+      parameters:
+        - $ref: '#/components/parameters/AdminUserId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminRevokedDTO' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  /api/v1/admin/stats/content:
+    get:
+      tags: [admin]
+      operationId: adminContentStats
+      summary: 内容统计（文章 / 分类 / 新闻源）
+      description: |
+        服务于后台"现在库里有什么"的判断。
+
+        `orphanArticles` 是**不属于任何现存新闻源**的文章数 —— 新闻源被删后其历史
+        文章会变成孤儿。这个数字长期不为零是正常现象（刻意不级联删除），但如果它
+        持续上涨且远超正常文章量，说明有源在被反复删除重建，值得看一眼。
+
+        `topSources` 按文章数降序取前 10，**刻意 LIMIT** —— 后台看板不需要一篇不漏。
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminContentDTO' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  /api/v1/admin/audio/tasks:
+    get:
+      tags: [admin]
+      operationId: adminListAudioTasks
+      summary: 语音合成任务列表
+      description: |
+        keyset 分页，游标语义 `id < cursor`，排序是纯 `id DESC`。
+
+        ★ 刻意**不做**"failed 优先"的智能排序：那种 CASE 表达式排序拿不到稳定的
+        keyset 游标，翻页会漏项 —— 想看失败任务请用 `status=failed` 筛。
+
+        `status` 取非法值时返回 **400**，而不是静默返回空列表 —— 拼错的筛选条件下
+        返回"没有数据"会被误读成"系统很健康"。合法值为 pending / processing /
+        done / failed。
+      parameters:
+        - name: status
+          in: query
+          description: 状态筛选，非法值返回 400
+          schema:
+            type: string
+            enum: [pending, processing, done, failed]
+        - name: limit
+          in: query
+          description: 每页条数，1..200，默认 20
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+        - name: cursor
+          in: query
+          description: 上一页最后一项的 id；省略或非法值都从第一页开始
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminAudioTaskListDTO' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  /api/v1/admin/audio/tasks/{taskId}/retry:
+    post:
+      tags: [admin]
+      operationId: adminRetryAudioTask
+      summary: 重试一个语音合成任务
+      description: |
+        把失败（或卡在 processing）的任务重置回 pending，交给后台 worker 重新处理。
+
+        重试本身不需要幂等键：重复点击只会让任务多排一次队，后果可接受。
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          description: 语音任务主键
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: OK，返回重置后的任务
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminAudioTaskDTO' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+
+  /api/v1/admin/system:
+    get:
+      tags: [admin]
+      operationId: adminSystem
+      summary: 系统与数据库状态
+      description: |
+        只读体检信息：进程版本、运行时、启停时间、SQLite 的 journal 模式与页数统计、
+        主要表的行数、堆内存。
+
+        ★ `dbBytes` = `pageSize × pageCount`，是**逻辑占用**。DELETE/VACUUM 之前
+        SQLite 不会把空间还给文件系统，所以这里显示的数字**几乎不会下降**。
+        想看磁盘真实占用请去看文件大小 —— 二者长期不一致是正常的，不要据此误判泄漏。
+
+        `freePages` / `freeRatio` 才是可回收空间的指示器。
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdminSystemDTO' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/DBBusy' }
+components:
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: |
+        采集器专用密钥。通过请求头传递：**不使用 query 参数**（避免出现在访问日志中）。
+        服务端以常数时间比较校验；失败返回 401（不区分 key 不存在与 key 错误）。
+        与账号体系**完全独立**：ingest 不使用 Bearer Token。
+
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        账号 Access Token（JWT HS256，2 小时）。
+        - 业务接口为**可选**（`OptionalAuth`）：带则解析用户上下文，不带按游客放行。
+        - `/api/v1/me/**` 为**必需**（`RequireAuth`）。
+        - 401 时按 `code` 区分：`TOKEN_EXPIRED`（静默 refresh 后重放）与 `UNAUTHORIZED`（降级游客态）。
+
+  parameters:
+    AdminUserId:
+      name: id
+      in: path
+      required: true
+      description: 目标用户主键
+      schema: { type: integer, format: int64 }
+    ArticleId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    SourceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: 增量同步水位（opaque base64url 字符串，由响应的 syncCursor / nextCursor 提供）
+      schema: { type: string }
+    PageCursor:
+      name: pageCursor
+      in: query
+      required: false
+      description: 分页游标（keyset on published_at,id），由响应的 nextPageCursor 提供
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: 每页条数。首屏/翻页默认 20（最大 100）；增量模式默认 100（最大 200）
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    Since:
+      name: since
+      in: query
+      required: false
+      description: |
+        收藏/已读增量游标（opaque base64url，复合键 `(updated_at, id)`）。
+        语义与文章列表 `cursor` **完全一致**，由响应的 `nextCursor` 提供。
+      schema: { type: string }
+    StateLimit:
+      name: limit
+      in: query
+      required: false
+      description: 每页条数，默认 200，最大 1000
+      schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+    WithArticles:
+      name: withArticles
+      in: query
+      required: false
+      description: |
+        是否为每条状态项附带文章摘要（`title` / `summary` / `sourceName` / `publishedAt`），
+        默认 `true`。
+
+        服务端以**一次批量 `id IN (...)` 查询**覆盖整页（非逐条查询），
+        因此开启的代价与页大小无关。设为 `false` 可完全跳过文章表查询，
+        响应退化为每个 item 只有 `articleId` / `deleted` / `updatedAt` 三个字段
+        （与本参数引入前的形状一致，老客户端不受影响）。
+
+        非法取值（如 `maybe`）**不会**返回 400，而是静默按默认 `true` 处理 ——
+        摘要是附加信息，不应让参数拼写错误阻断增量同步。
+      schema: { type: boolean, default: true }
+
+  schemas:
+
+    # ---------- 通用 ----------
+    Envelope:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            OK | BAD_REQUEST | VALIDATION_FAILED | UNAUTHORIZED | INVALID_API_KEY |
+            INVALID_CREDENTIALS | TOKEN_EXPIRED | FORBIDDEN | NOT_FOUND | CONFLICT |
+            PAYLOAD_TOO_LARGE | UNPROCESSABLE | RATE_LIMITED | TTS_UNAVAILABLE |
+            TTS_QUEUE_FULL | SERVICE_BUSY | DB_BUSY | INTERNAL_ERROR
+
+            其中 `TOKEN_EXPIRED` / `FORBIDDEN` 用于区分 401 与 403 的具体成因
+            （见 securitySchemes.BearerAuth）；`TTS_UNAVAILABLE` / `TTS_QUEUE_FULL`
+            为合成链路的两种临时态（503 / 429，均带 `Retry-After`），客户端应退避重试。
+          example: OK
+        message: { type: string, example: ok }
+        requestId: { type: string, example: V1StGXR8_Z5jdHi6B-myT }
+        data:
+          description: 成功时为业务数据（对象或数组）；失败时可为 null 或含 details[]
+
+    Category:
+      type: string
+      enum: [tech, finance, sports, world, china, ent, life, auto, military, science, health, other]
+      default: other
+
+    # ---------- Ingest ----------
+    ArticleIngestItem:
+      type: object
+      required: [url, title, publishedAt]
+      description: |
+        标准化文章条目。
+        **语义约束**：`sourceKey` 与 `sourceId` 至少提供其一；两者都提供且不一致 → 400 VALIDATION_FAILED。
+      properties:
+        sourceKey:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-z0-9][a-z0-9_-]*$'
+          description: 源的稳定业务键（推荐），由 GET /api/v1/sources 获取
+        sourceId:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 源 ID（sourceKey 的备选）
+        externalId:
+          type: [string, 'null']
+          maxLength: 128
+          description: 采集器侧唯一 ID。有值时与 sourceId 组成**去重键 1**
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: 原文链接（必填）。服务端规范化后作为**去重键 2**
+        title:
+          type: string
+          minLength: 1
+          maxLength: 512
+        summary:
+          type: [string, 'null']
+          maxLength: 2000
+        content:
+          type: [string, 'null']
+          maxLength: 20000
+          description: 正文。服务端按 ingest.storeContent（默认 false）决定是否落库
+        category:
+          anyOf:
+            - $ref: '#/components/schemas/Category'
+            - type: 'null'
+          description: |
+            缺省（缺失/null）时继承 source.category；显式值优先（含显式 other）。
+
+            ★ **该值是「逐轮覆盖」而非「首次落库即终态」**：每一轮摄入提交的 category
+            都是权威值，缺省时的权威值等于源分类。因此显式传 `other` 的文章，若下一轮
+            改为缺省提交，会被源分类覆盖（回执为 `updated`）。
+
+            这意味着**采集器每一轮都应提交确定的 category**：要么每轮都显式传（值可任意，
+            含 `other`），要么每轮都缺省（跟随源分类变化）。「首轮显式、后续缺省」的写法
+            会导致分类在两轮之间来回跳变，并持续刷新 `updated_at` 污染增量游标。
+        author:
+          type: [string, 'null']
+          maxLength: 128
+        imageUrl:
+          type: [string, 'null']
+          format: uri
+          maxLength: 2048
+        publishedAt:
+          type: string
+          format: date-time
+          description: |
+            RFC 3339 / ISO 8601，需带时区（无时区按服务端 ingest.defaultTimezone 解析，默认 UTC）。
+            校验：now-365d ≤ publishedAt ≤ now+24h，否则 422 UNPROCESSABLE
+        language:
+          type: [string, 'null']
+          maxLength: 16
+          default: zh-CN
+          description: BCP 47
+        tags:
+          type: [array, 'null']
+          maxItems: 10
+          items: { type: string, minLength: 1, maxLength: 32 }
+
+    IngestReceipt:
+      type: object
+      required: [received, created, updated, skipped, failed]
+      description: '恒等式：created + updated + skipped + failed = received'
+      properties:
+        received: { type: integer, minimum: 0 }
+        created:
+          type: integer
+          minimum: 0
+          description: 新插入
+        updated:
+          type: integer
+          minimum: 0
+          description: 已存在且**内容有变化**（contentHash 不同）→ UPDATE 并刷新 updated_at
+        skipped:
+          type: integer
+          minimum: 0
+          description: 已存在且**内容无变化** → 仅刷新 last_seen_at，**不刷新 updated_at**（不污染增量游标）
+        failed: { type: integer, minimum: 0 }
+        durationMs: { type: integer }
+        results:
+          type: [array, 'null']
+          description: 默认仅含 failed 明细；?verbose=all 时返回全部条目（含 articleId）
+          items:
+            type: object
+            required: [index, status]
+            properties:
+              index:
+                type: integer
+                minimum: 0
+                description: 在 items 中的下标（0-based）
+              status:
+                type: string
+                enum: [created, updated, skipped, failed]
+              reason:
+                type: [string, 'null']
+                enum: [UNCHANGED, VALIDATION_FAILED, SOURCE_NOT_FOUND, DEDUP_CONFLICT, INTERNAL, 'null']
+                description: skipped 时为 UNCHANGED；failed 时为具体原因
+              field:
+                type: [string, 'null']
+                description: 校验失败的具体字段（如 items[3].url）
+              message: { type: [string, 'null'] }
+              articleId:
+                type: [integer, 'null']
+                format: int64
+                description: 成功（含 skipped）时的服务端文章 ID
+              externalId: { type: [string, 'null'] }
+              url: { type: [string, 'null'] }
+
+    # ---------- 查询 ----------
+    ArticleDTO:
+      type: object
+      required: [id, title, url, publishedAt]
+      properties:
+        id: { type: integer, format: int64 }
+        sourceId: { type: integer, format: int64 }
+        sourceKey: { type: string }
+        sourceName: { type: string }
+        category: { $ref: '#/components/schemas/Category' }
+        title: { type: string }
+        summary: { type: string }
+        content:
+          type: [string, 'null']
+          description: 仅当该文章实际存了正文时出现（默认服务端不存正文）
+        imageUrl: { type: [string, 'null'] }
+        author: { type: [string, 'null'] }
+        url: { type: string }
+        publishedAt: { type: string, format: date-time }
+        updatedAt:
+          type: string
+          format: date-time
+          description: 增量游标依据；仅在内容真实变更时刷新
+        tags:
+          type: array
+          items: { type: string }
+        audio:
+          anyOf:
+            - $ref: '#/components/schemas/AudioBrief'
+            - type: 'null'
+          description: 仅当 withAudio=true 时出现
+
+    AudioBrief:
+      type: object
+      properties:
+        status: { type: string, enum: [none, pending, processing, ready, failed] }
+        audioId: { type: [integer, 'null'], format: int64 }
+        voice: { type: [string, 'null'] }
+        speed: { type: [number, 'null'], format: float }
+
+    ArticlePage:
+      type: object
+      required: [items, hasMore]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ArticleDTO' }
+        nextCursor:
+          type: [string, 'null']
+          description: 增量模式下一页水位；hasMore=false 时为 null
+        nextPageCursor:
+          type: [string, 'null']
+          description: 翻页模式下一页游标；无更多时为 null
+        syncCursor:
+          type: string
+          description: 服务端当前水位（now - 2s 重叠窗口），客户端保存用于下次增量
+        hasMore: { type: boolean }
+        serverTime: { type: string, format: date-time }
+        serverTimeMs: { type: integer, format: int64 }
+
+    SourceDTO:
+      type: object
+      required: [id, key, name, url]
+      properties:
+        id: { type: integer, format: int64 }
+        key: { type: string }
+        name: { type: string }
+        url: { type: string }
+        type: { type: string, enum: [rss, atom, api, manual], default: rss }
+        category: { $ref: '#/components/schemas/Category' }
+        isDefault:
+          type: boolean
+          description: 系统默认源，不可删除（只能停用）
+        enabled: { type: boolean }
+        suggestInterval:
+          type: integer
+          description: 建议采集间隔（秒），仅供外部采集器参考
+        iconUrl: { type: [string, 'null'] }
+        language: { type: [string, 'null'] }
+        remark: { type: [string, 'null'] }
+        articleCount: { type: integer, description: 可选：该源文章数 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    SourceInput:
+      type: object
+      required: [name, url]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 128 }
+        url: { type: string, format: uri, maxLength: 2048 }
+        type: { type: string, enum: [rss, atom, api, manual], default: rss }
+        category: { $ref: '#/components/schemas/Category' }
+        suggestInterval: { type: integer, minimum: 60, default: 1800 }
+        iconUrl: { type: [string, 'null'], format: uri, maxLength: 2048 }
+        language: { type: [string, 'null'], maxLength: 16 }
+        remark: { type: [string, 'null'], maxLength: 500 }
+        enabled: { type: boolean, default: true }
+
+    # ---------- Audio ----------
+    AudioTaskDTO:
+      type: object
+      required: [id, articleId, status]
+      properties:
+        id: { type: integer, format: int64 }
+        articleId: { type: integer, format: int64 }
+        voice: { type: string }
+        speed: { type: number, format: float }
+        status: { type: string, enum: [pending, processing, ready, failed] }
+        audioId: { type: [integer, 'null'], format: int64 }
+        provider: { type: [string, 'null'], enum: [tencent, ali, xunfei, 'null'] }
+        retryCount: { type: integer }
+        errorCode: { type: [string, 'null'] }
+        errorMsg: { type: [string, 'null'] }
+        textChars: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AudioDTO:
+      type: object
+      required: [id, articleId]
+      properties:
+        id: { type: integer, format: int64 }
+        articleId: { type: integer, format: int64 }
+        voice: { type: string }
+        speed: { type: number, format: float }
+        format: { type: string, example: mp3 }
+        durationMs: { type: integer }
+        sizeBytes: { type: integer }
+        sampleRate: { type: integer, example: 16000 }
+        provider: { type: [string, 'null'] }
+        url:
+          type: string
+          description: 音频下载地址，例 /api/v1/audio/5127
+        createdAt: { type: string, format: date-time }
+
+    # ---------- 账号（v1.1） ----------
+    UserDTO:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        username: { type: string }
+        email: { type: [string, 'null'] }
+        role: { type: string, enum: [user, admin] }
+        createdAt: { type: string, format: date-time }
+        lastLoginAt: { type: [string, 'null'], format: date-time }
+
+    TokenResponse:
+      type: object
+      required: [accessToken, user]
+      properties:
+        accessToken:
+          type: string
+          description: JWT(HS256)，2 小时；客户端仅存**内存**
+        refreshToken:
+          type: [string, 'null']
+          description: |
+            32 字节不透明随机串，30 天滑动续期。
+            Web 同源部署时由服务端写入 `httpOnly + Secure + SameSite=Lax` Cookie，
+            此时响应体中该字段为 null；跨域部署降级为响应体返回（需客户端自行安全存储）。
+        expiresIn: { type: integer, example: 7200, description: accessToken 剩余秒数 }
+        user: { $ref: '#/components/schemas/UserDTO' }
+
+    MergeItem:
+      type: object
+      required: [articleId, updatedAt]
+      properties:
+        articleId: { type: integer, format: int64 }
+        deleted:
+          type: boolean
+          default: false
+          description: true = 墓碑（本地已取消收藏/已读）
+        updatedAt:
+          type: integer
+          format: int64
+          description: 本地侧更新时间（epoch 毫秒），用于 LWW 冲突判定
+
+    PreferenceKV:
+      type: object
+      description: 偏好键值对，键含命名空间点号（如 tts.voice / tts.speed / ui.density）
+      additionalProperties:
+        type: [string, number, boolean, 'null']
+      example:
+        tts.voice: '101001'
+        tts.speed: 1.0
+        ui.density: comfortable
+
+    MergeRequest:
+      type: object
+      required: [clientId, nonce]
+      properties:
+        clientId:
+          type: string
+          maxLength: 64
+          description: 客户端实例标识（首次启动生成并持久化，reinstall 重置）
+        nonce:
+          type: string
+          maxLength: 64
+          description: 幂等键（每批次生成一次并持久化至成功；重试沿用同一 nonce）
+        favorites:
+          type: array
+          maxItems: 5000
+          items: { $ref: '#/components/schemas/MergeItem' }
+        reads:
+          type: array
+          maxItems: 5000
+          items: { $ref: '#/components/schemas/MergeItem' }
+        preferences: { $ref: '#/components/schemas/PreferenceKV' }
+
+    MergeCounts:
+      type: object
+      required: [received, added, merged, skipped]
+      properties:
+        received: { type: integer }
+        added: { type: integer, description: 新增行 }
+        merged: { type: integer, description: 命中且本地更新被采纳（LWW 胜出） }
+        skipped: { type: integer, description: 命中但云端更新（LWW 判负） }
+
+    MergeResult:
+      type: object
+      required: [applied, replayed]
+      properties:
+        applied: { type: boolean, description: 是否执行了写入 }
+        replayed:
+          type: boolean
+          description: 'true = 命中 merge_log 幂等键，直接回放历史结果（零写入）'
+        favorites: { $ref: '#/components/schemas/MergeCounts' }
+        reads: { $ref: '#/components/schemas/MergeCounts' }
+        preferenceApplied:
+          type: boolean
+          description: 是否有偏好项被写入（服务端已有值时为 false）
+        snapshotCursor:
+          type: string
+          description: 合并后服务端水位，客户端可用作后续增量同步的起点
+
+    StateItem:
+      type: object
+      required: [articleId, deleted, updatedAt]
+      description: |
+        **⚠️ 实现强制项（DEC-11）：墓碑项必须随增量流返回。**
+
+        若把"取消收藏/取消已读"实现为物理删除，该条目会从增量流中彻底消失，
+        其他设备**永远收不到"对方已取消"**，跨端删除无法同步。
+
+        因此：`deleted=true`（`deleted_at` 非空）的记录**必须保留在结果中**，
+        由客户端落**本地删除**。服务端查询**不得**追加 `AND deleted_at IS NULL`；
+        唯一清理时机是文章本身被归档删除（级联）。
+      properties:
+        articleId: { type: integer, format: int64 }
+        deleted:
+          type: boolean
+          description: 'true = 墓碑（已取消收藏/已读）。客户端收到后应本地移除该条，而非忽略'
+        updatedAt: { type: integer, format: int64 }
+        title:
+          type: string
+          description: |
+            文章标题（可选摘要，仅 `withArticles=true` 时返回）。
+
+            `withArticles=false` 或该 article 行已被归档物理删除时本字段缺席，
+            客户端按"缺字段"降级渲染即可，不应视为协议错误。
+        summary:
+          type: string
+          description: 文章摘要（同上，可选）
+        sourceName:
+          type: string
+          description: 来源名（同上，可选）
+        publishedAt:
+          type: string
+          format: date-time
+          description: 发布时间，ISO 8601 UTC（同上，可选；格式与 `ArticleDTO.publishedAt` 一致）
+
+    StatePage:
+      type: object
+      required: [items, hasMore]
+      description: |
+        `items` 中**同时包含**新增/更新项与墓碑项（`deleted=true`），两类都需被客户端处理。
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/StateItem' }
+          example:
+            - { articleId: 88421, deleted: false, updatedAt: 1730000000000 }
+            - { articleId: 88422, deleted: true,  updatedAt: 1730000100000 }
+        nextCursor:
+          type: [string, 'null']
+          description: 下一页增量游标；hasMore=false 时为 null
+        hasMore: { type: boolean }
+        serverTimeMs: { type: integer, format: int64 }
+
+    BatchStateRequest:
+      type: object
+      required: [articleIds, read]
+      description: |
+        ★ `read` **必填**，不接受省略。
+
+        省略与显式 `false` 语义相反且都危险：服务端会把缺省视为 `false`
+        （"标记为未读"，写墓碑），漏传字段等于静默抹掉这批文章的已读记录。
+        漏传请让服务端返回 400，而不是猜。
+      properties:
+        articleIds:
+          type: array
+          minItems: 1
+          maxItems: 500
+          description: |
+            文章 id 列表，**最多 500 条**（超出 → `413 PAYLOAD_TOO_LARGE`，整批未写入）。
+            重复 id 会被去重；`articleId <= 0` → `400`。
+            任一 id 不存在 → 整批 `404`，整批未写入。
+          items: { type: integer, format: int64 }
+          example: [88421, 88422, 88423]
+        read:
+          type: boolean
+          description: true = 标记为已读；false = 标记为未读（写墓碑，不物理删除）
+        favorite:
+          type: [boolean, 'null']
+          default: null
+          description: |
+            可选。`true` = 同时收藏，`false` = 同时取消收藏（写墓碑）；
+            **`null` / 省略 = 本批次完全不改动收藏**（只改已读）。
+          example: true
+
+    BatchStateResult:
+      type: object
+      required: [readsChanged, favoritesChanged]
+      description: |
+        批次是原子的，故两个计数即全量结果，**没有**逐条成败清单。
+        返回 200 意味着这些行已全部落库；失败则一条都没写。
+      properties:
+        readsChanged:
+          type: integer
+          description: |
+            本批次**提交**的已读条数（已按 articleId 去重）。
+
+            ★ **不要当成"状态实际发生变化的条数"**：服务端对批次内每个 id 都无条件计数，
+            不比较库内现状。所以重复提交同一批仍会返回同样的数字
+            （幂等由唯一索引 + `ON CONFLICT DO UPDATE` 保证，不是靠计数体现）。
+
+            要知道"本次新增了多少条已读"，客户端需在提交前自行比对本地未读集合 ——
+            用它做成功提示的数字会误导用户（例：对 3 篇全已读的列表再点一次，仍回3）。
+          example: 3
+        favoritesChanged:
+          type: integer
+          description: |
+            本批次**提交**的收藏条数；`favorite` 为 null 时恒为 0。
+            语义同`readsChanged`（非"实际变化数"）。
+          example: 0
+
+    SessionDTO:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        deviceName: { type: [string, 'null'] }
+        clientId: { type: string }
+        lastSeenAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        current:
+          type: boolean
+          description: 是否为当前请求所使用的会话
+    # ---------------- 管理后台（admin） ----------------
+
+    AdminOverviewDTO:
+      type: object
+      title: AdminOverviewDTO
+      description: |
+        后台概览快照。刻意做成**扁平结构**而不是嵌套分组 —— 调用方（后台首页）要的
+        就是一把抓的扁平数字，嵌套只会让前端多做一层解包且不带来任何语义收益。
+      additionalProperties: false
+      properties:
+        users: { type: integer, format: int64, description: 注册用户总数（含已停用） }
+        admins: { type: integer, format: int64, description: 未被停用的管理员数。为 0 时后台将无人可进，只能走 promote-admin CLI }
+        disabledUsers: { type: integer, format: int64, description: 已停用用户数 }
+        activeSessions: { type: integer, format: int64, description: 未过期会话数（expires_at > now），不是"登录人数" }
+        articles: { type: integer, format: int64 }
+        sources: { type: integer, format: int64 }
+        audios: { type: integer, format: int64, description: 已合成的音频条数 }
+        failedAudioTasks: { type: integer, format: int64, description: status=failed 的任务数 }
+        pendingAudioTasks: { type: integer, format: int64, description: status=pending 的任务数 }
+        articlesLast24h: { type: integer, format: int64, description: 近 24 小时入库文章数，用于判断采集器是否还活着 }
+        audioTaskStatus:
+          type: object
+          description: 各状态任务数。只包含出现过的状态 —— 从没失败过就没有 failed 键，前端别指望它恒存在
+          additionalProperties: { type: integer, format: int64 }
+        schemaVersion: { type: integer, description: 数据库迁移版本号 }
+        uptimeSeconds: { type: integer, format: int64 }
+        serverVersion: { type: string }
+        goVersion: { type: string }
+        generatedAt: { type: integer, format: int64, description: 本快照生成时刻，Unix 秒 }
+      required: [users, admins, disabledUsers, activeSessions, articles, sources, audios,
+                 failedAudioTasks, pendingAudioTasks, articlesLast24h, audioTaskStatus,
+                 schemaVersion, uptimeSeconds, serverVersion, goVersion, generatedAt]
+
+    AdminUserDTO:
+      type: object
+      title: AdminUserDTO
+      description: |
+        用户档案 + 权限能力位。
+
+        ★ 刻意**不复用** UserDTO：那份结构带 passwordHash 等敏感字段（尽管当前为空串），
+        序列化给后台列表等于白白扩大攻击面。
+
+        ★ 能力位由**服务端下发**，前端不得自己推"能不能点"：
+        "最后一个可用管理员"的规则若前后端各写一遍，必然漂移 —— 而漂移的后果可能是
+        后台把自己锁死在门外。出错时能力位保守返回全 false（按钮变灰可忍，给出
+        "可以操作"的错判不可忍）。
+      additionalProperties: false
+      properties:
+        id: { type: integer, format: int64 }
+        username: { type: string }
+        email: { type: string, description: 未填邮箱为空串，不是 null }
+        role: { type: string, enum: [user, admin] }
+        disabled: { type: boolean, description: true 表示已停用，三条入口（token 校验/登录/refresh）都会拦截 }
+        createdAt: { type: integer, format: int64, description: Unix 秒 }
+        lastLoginAt: { type: integer, format: int64, description: Unix 秒；从未登录为 0 }
+        sessionCount: { type: integer, description: 未过期会话数（expires_at > now），不是历史登录次数 }
+        favoriteCount: { type: integer }
+        readCount: { type: integer }
+        self: { type: boolean, description: 目标就是操作者本人 }
+        canChangeRole: { type: boolean, description: 能否改其角色。对自己恒 false，对最后一个可用管理员恒 false }
+        canDisable: { type: boolean, description: 能否停用/启用。对自己恒 false }
+        canDelete: { type: boolean, description: 能否删除。对自己恒 false }
+        canRevokeAll: { type: boolean, description: 能否吊销其全部会话。对自己恒 false }
+      required: [id, username, email, role, disabled, createdAt, lastLoginAt, sessionCount,
+                 favoriteCount, readCount, self, canChangeRole, canDisable, canDelete, canRevokeAll]
+
+    AdminUserListDTO:
+      type: object
+      title: AdminUserListDTO
+      description: |
+        用户列表页。keyset 分页。
+
+        ★ `nextCursor` 是**字符串**（虽然值是数字）：用户主键是 int64，JSON 里交给 JS
+        会有精度风险。没有下一页时为空串。这与阅读态 StatePage 的 null 语义不同 —— 两处
+        分页契约并不统一，接入时按各自规则处理，不要假设一致。
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AdminUserDTO' }
+        nextCursor: { type: string, description: 下一页游标；无下一页为空串 }
+        hasMore: { type: boolean, description: 是否还有下一页。比"用 nextCursor 是否为空来判断"更直白，前端优先用它 }
+        total: { type: integer, format: int64, description: 整个筛选条件下的总数，与游标无关 }
+      required: [items, nextCursor, hasMore, total]
+
+    AdminCreateUserInput:
+      type: object
+      title: AdminCreateUserInput
+      additionalProperties: false
+      properties:
+        username: { type: string, minLength: 3, maxLength: 64 }
+        password: { type: string, minLength: 8, description: 沿用全局密码策略，弱密码返回 400 且带 details }
+        email:
+          type: string
+          description: |
+            可为空串（本系统无 SMTP、不发验证邮件，邮箱是可选资料而非登录凭据）。
+            注意：因此**不存在邮箱找回密码**这条路径。
+        role: { type: string, enum: [user, admin], default: user, description: 省略时按 user 处理 }
+      required: [username, password]
+
+    AdminRevokedDTO:
+      type: object
+      title: AdminRevokedDTO
+      additionalProperties: false
+      properties:
+        revoked: { type: integer, format: int64, description: 实际删除的会话行数；已是空会话时为 0，不是错误 }
+      required: [revoked]
+
+    AdminCategoryStatDTO:
+      type: object
+      title: AdminCategoryStatDTO
+      additionalProperties: false
+      properties:
+        category: { type: string, description: 空串表示未分类 }
+        count: { type: integer, format: int64 }
+      required: [category, count]
+
+    AdminSourceStatDTO:
+      type: object
+      title: AdminSourceStatDTO
+      additionalProperties: false
+      properties:
+        sourceId: { type: integer, format: int64 }
+        sourceName: { type: string }
+        enabled: { type: boolean }
+        articleCount: { type: integer, format: int64, description: 该源名下文章数（含孤儿源，见 orphanArticles） }
+        lastSeenAt: { type: integer, format: int64, description: 最近一次入库时间，Unix 秒；从未入库为 0 }
+      required: [sourceId, sourceName, enabled, articleCount, lastSeenAt]
+
+    AdminContentDTO:
+      type: object
+      title: AdminContentDTO
+      additionalProperties: false
+      properties:
+        total: { type: integer, format: int64 }
+        last24h: { type: integer, format: int64 }
+        last7d: { type: integer, format: int64 }
+        disabledSources: { type: integer, format: int64 }
+        orphanArticles:
+          type: integer
+          format: int64
+          description: |
+            不属于任何**现存**新闻源的文章数。源被删后其历史文章即成孤儿（刻意不级联
+            删除 —— 内容资产比源记录值钱）。长期非零是常态；若它持续上涨远超文章总量，
+            说明有源在被反复删除重建。
+        byCategory:
+          type: array
+          items: { $ref: '#/components/schemas/AdminCategoryStatDTO' }
+        topSources:
+          type: array
+          description: 按文章数降序，最多 10 条
+          maxItems: 10
+          items: { $ref: '#/components/schemas/AdminSourceStatDTO' }
+      required: [total, last24h, last7d, disabledSources, orphanArticles, byCategory, topSources]
+
+    AdminAudioTaskDTO:
+      type: object
+      title: AdminAudioTaskDTO
+      additionalProperties: false
+      properties:
+        id: { type: integer, format: int64, description: 任务主键 }
+        audioId: { type: integer, format: int64, description: 关联音频 id；尚未产出时为 0 }
+        articleId: { type: integer, format: int64 }
+        articleTitle: { type: string, description: 冗余返回标题，省得前端为每行再查一次文章 }
+        voice: { type: string }
+        speed: { type: number, format: double }
+        status: { type: string, enum: [pending, processing, done, failed] }
+        provider: { type: string, description: TTS 提供方，例如 mock / aliyun / tencent }
+        errorCode: { type: string, description: 失败码；成功为空串 }
+        errorMsg: { type: string, description: 失败原因（已脱敏，不含密钥/原文） }
+        retryCount: { type: integer }
+        textChars: { type: integer, description: 待合成文本长度，用于估算成本 }
+        createdAt: { type: integer, format: int64, description: Unix 秒 }
+        updatedAt: { type: integer, format: int64, description: Unix 秒 }
+      required: [id, audioId, articleId, articleTitle, voice, speed, status, provider,
+                 errorCode, errorMsg, retryCount, textChars, createdAt, updatedAt]
+
+    AdminAudioTaskListDTO:
+      type: object
+      title: AdminAudioTaskListDTO
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AdminAudioTaskDTO' }
+        statusCounts:
+          type: object
+          description: 在当前筛选条件下各状态的数量。只含出现过的状态
+          additionalProperties: { type: integer, format: int64 }
+        audioCount: { type: integer, format: int64, description: 已产出音频总数 }
+        audioBytes: { type: integer, format: int64, description: 音频占用字节数，用于估算磁盘 }
+        total: { type: integer, format: int64, description: 整个筛选条件下的总数，与游标无关 }
+        hasMore: { type: boolean }
+        nextCursor: { type: string, description: 下一页游标；无下一页为空串 }
+      required: [items, statusCounts, audioCount, audioBytes, total, hasMore, nextCursor]
+
+    AdminSystemDTO:
+      type: object
+      title: AdminSystemDTO
+      description: |
+        只读体检信息。刻意**展平为单个对象**而不是拆成 {runtime, db} 两组：后台一屏渲染，
+        嵌套只增加前端解包成本且不带来语义收益。
+      additionalProperties: false
+      properties:
+        serverVersion: { type: string }
+        goVersion: { type: string }
+        goos: { type: string }
+        goarch: { type: string }
+        numGoroutine: { type: integer }
+        uptimeSeconds: { type: integer, format: int64 }
+        startedAt: { type: integer, format: int64, description: 进程启动时刻，Unix 秒 }
+        schemaVersion: { type: integer }
+        journalMode: { type: string }
+        dbBytes: { type: integer, format: int64 }
+        pageSize: { type: integer, format: int64 }
+        pageCount: { type: integer, format: int64 }
+        freePages: { type: integer, format: int64 }
+        freeRatio: { type: number, format: double }
+        tableCounts:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+        heapAllocMb: { type: number, format: double }
+      required: [serverVersion, goVersion, goos, goarch, numGoroutine, uptimeSeconds,
+                 startedAt, schemaVersion, journalMode, dbBytes, pageSize, pageCount,
+                 freePages, freeRatio, tableCounts, heapAllocMb]
+
+  responses:
+    BadRequest:
+      description: JSON 解析失败或结构不符
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+          example: { code: BAD_REQUEST, message: 请求体不是合法 JSON, requestId: V1StGXR8_Z5jdHi6B-myT }
+    Unauthorized:
+      description: 缺少或无效的 X-Api-Key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+          example: { code: INVALID_API_KEY, message: API Key 无效, requestId: V1StGXR8_Z5jdHi6B-myT }
+    Forbidden:
+      description: |
+        身份有效但权限不足 / 账号已被停用。
+        与 401 的界限必须清楚：401 客户端应去 refresh，403 必须立即跳出登录态 ——
+        混为一谈会让被降权的管理员陷入静默重试循环。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+          example: { code: FORBIDDEN, message: 需要管理员权限, requestId: V1StGXR8_Z5jdHi6B-myT }
+    ValidationFailed:
+      description: 请求体或查询参数校验失败，details 内含逐字段说明
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    Conflict:
+      description: 冲突（如删除默认源、并发写入唯一约束冲突）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    PayloadTooLarge:
+      description: Body > 4 MB 或 items 超过上限（默认 200）→ 请拆分为更小的批次
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+          example: { code: PAYLOAD_TOO_LARGE, message: items 数量超过上限 200, requestId: V1StGXR8_Z5jdHi6B-myT }
+    Unprocessable:
+      description: 语义校验失败（如 publishedAt 超出允许区间、源已停用）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    TooManyRequests:
+      description: 触发限流
+      headers:
+        Retry-After: { schema: { type: integer }, example: 1 }
+        X-RateLimit-Limit: { schema: { type: integer } }
+        X-RateLimit-Remaining: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+          example: { code: RATE_LIMITED, message: 请求过于频繁，请稍后重试, requestId: V1StGXR8_Z5jdHi6B-myT }
+    Internal:
+      description: 未预期错误（可安全重试，ingest 幂等）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    DBBusy:
+      description: SQLite 写锁争用超过 busy_timeout（可安全重试）
+      headers:
+        Retry-After: { schema: { type: integer }, example: 2 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+          example: { code: DB_BUSY, message: 数据库繁忙，请重试, requestId: V1StGXR8_Z5jdHi6B-myT }
+    ServiceBusy:
+      description: |
+        Argon2id 哈希并发信号量排队超时（DEC-9）。
+        登录/注册并发超过 `auth.argon2_max_concurrency`（默认 2）时排队，
+        等待超过 `auth.argon2_queue_timeout_ms`（默认 3000ms）即返回本错误。
+        客户端应按 `Retry-After` 退避重试。
+      headers:
+        Retry-After: { schema: { type: integer }, example: 1 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+          example: { code: SERVICE_BUSY, message: 服务繁忙，请稍后重试, requestId: V1StGXR8_Z5jdHi6B-myT }

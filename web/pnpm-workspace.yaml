@@ -1,0 +1,21 @@
+# pnpm 工作区设置（pnpm 12 已把 package.json 里的 `pnpm.*` 字段迁到这里）。
+#
+# ── 1. 为什么显式表态 esbuild 的构建脚本 ──
+# pnpm 10+ 默认拦截依赖的构建脚本，不声明就会以 ERR_PNPM_IGNORED_BUILDS 失败。
+# 这里选 `false`（拒绝执行）：esbuild 的二进制来自可选依赖 @esbuild/win32-x64，
+# 已随包安装到位；它的 postinstall 只是 spawn 一次 `node bin/esbuild --version` 做校验，
+# 而在本机（WorkBuddy 托管的运行中 node.exe）该校验必然报 `spawnSync node.exe EBUSY`。
+# 已实测 `require('esbuild').transform()` 正常，拒绝这个多余脚本是安全的。
+allowBuilds:
+  esbuild: false
+
+# ── 2. 为什么用 hoisted（复制式）而不是默认的 isolated（软链接式）──
+# 本机 D 盘的文件系统**不支持创建符号链接/目录联接**（实测 `ln -s` 静默失败、
+# 连出来的目录是空的）。isolated 模式下 pnpm 依赖软链接把 node_modules/xxx
+# 指向 node_modules/.pnpm/xxx/node_modules/xxx，结果是 node_modules 里
+# 只剩几个空目录 scope，`tsc`/`vite` 等可执行文件全部无法解析。
+#
+# hoisted 模式改为把包实体复制到扁平的 node_modules/（npm/yarn classic 的行为），
+# 不依赖任何链接，因此在本机与其它机器上都能装成功。
+# 代价是磁盘占用略大、依赖实例不做隔离 —— 对本项目（单包、无插件化需求）无影响。
+nodeLinker: hoisted

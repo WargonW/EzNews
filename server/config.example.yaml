@@ -1,0 +1,130 @@
+# EZNews Server 配置示例
+# 优先级：内置默认值 < 本文件 < 环境变量（EZNEWS_*）
+# ${VAR} 占位符会在加载时展开为同名环境变量的值（未定义则展开为空串）。
+#
+# ★ 未知配置键会导致启动失败（yaml.KnownFields(true)）。这是刻意的：
+#   把 refreshCookie 写成 refresh_cookie 会被静默丢弃、回落默认值，
+#   而"以为配了、实际没生效"正是最难排查的一类故障。
+#   改键名时请同步核对本文件与 ARCHITECTURE.md §13.1。
+
+server:
+  addr: ":8080"
+  readTimeout: 15s
+  writeTimeout: 60s        # 音频传输需要较长写超时
+  shutdownTimeout: 30s
+
+db:
+  path: ./data/eznews.db
+  busyTimeoutMs: 5000
+  cacheSizeKB: 16000
+  checkpointIntervalMin: 5
+
+auth:
+  # —— 采集器 ingest 鉴权（与账号体系完全独立）——
+  # 未配置任何 apiKeys 时服务端拒绝启动（防"裸奔上线"）。
+  apiKeys:
+    - id: crawler-01
+      key: ${EZNEWS_API_KEY_1}      # 强烈建议用环境变量注入
+  requireKeyForRead: false
+
+  # —— 账号体系（v1.1）——
+  # ★ 环境变量名是 EZNEWS_AUTH_JWT_SECRET（带 AUTH_ 前缀），
+  #   不是 EZNEWS_JWT_SECRET。写成后者会被 os.Getenv 展开成空串，
+  #   于是每次重启都重新生成密钥、所有已签发的 Access Token 立即失效、用户被集体登出。
+  jwtSecret: ${EZNEWS_AUTH_JWT_SECRET}
+  # 缺省时启动自动生成 32 字节随机密钥并落盘到此路径（权限 0600）。
+  # 有了它，重启不会踢掉已登录用户；删掉它就会。
+  jwtSecretPath: ./data/jwt_secret
+  accessTokenTTL: 2h
+  refreshTokenTTL: 720h             # 30 天，滑动续期
+  registrationEnabled: true         # 单人自托管：注册首账号后建议置 false
+
+  argon2:
+    # ★ memory 单位是 KiB，不是 MiB。填 19 会退化成 19 KiB 内存硬度，
+    #   密码哈希强度归零且不报任何错。启动校验会拦截 < 8192 KiB 的配置。
+    memory: 19456                   # KiB = 19 MiB；小内存机器可下调至 12288（12 MiB）
+    time: 2
+    threads: 1
+  # ★ 并发 Argon2id 的内存是叠加的：19 MiB × N。
+  #   N=8 就是 152 MB，直接击穿"常驻 <150 MB"的目标。
+  #   maxConcurrency=2 → 上界38 MiB；配合 queueTimeoutMs 实现快速失败。
+  argon2MaxConcurrency: 2
+  # 等待并发槽的最长毫秒数，超时返回 503 SERVICE_BUSY。
+  # 缺省会变成无限期阻塞在信号量上，与"快速失败"意图完全相反。
+  argon2QueueTimeoutMs: 3000
+
+  loginLimitPerUser: "5/m"
+  loginLimitPerIP: "20/m"
+  lockoutDuration: 15m
+
+  # ★ DEC-7：refresh token 重放的宽限窗口（秒）。
+  #   窗口内且 client_id 相同 → 判为弱网重试，幂等再轮换一次，不踢设备。
+  #   超窗或异设备 → 判为泄露，撤销该用户全部会话。
+  #   Android 弱网下这个值太小，用户会被自己的重试踢下线。
+  refreshReuseGraceSec: 60
+  refreshReplayGuardMax: 10
+
+  # —— Refresh Token 的两条传输通道——
+  #   Cookie 通道（Web 端，httpOnly，防 XSS 窃取）
+  #   响应体通道（Android 端，原生 WebView 不共享 Cookie 池）
+  # ★ 两个都关是致命的：症状是"能登录、2 小时后集体静默掉线"。
+  #   启动校验会直接拒绝这种配置。
+  refreshCookie: true
+  refreshTokenInBody: true
+  # ★ 必须是 /api/v1/auth（宽路径）。
+  #   窄化到 /api/v1/auth/refresh 会导致浏览器调 logout 时不带 Cookie，
+  #   服务端拿不到 refresh token、无法销毁 session —— 登出形同虚设。
+  refreshCookiePath: /api/v1/auth
+
+ingest:
+  maxBatchItems: 200
+  maxBodyBytes: 4194304             # 4 MB
+  storeContent: false               # PRD-Q3：默认不存正文
+  autoCreateSource: false
+  defaultTimezone: UTC
+  trackParamBlacklist: ["utm_*", "spm", "from", "ref", "share_*", "hmsr"]
+
+ratelimit:
+  globalRps: 100
+  globalBurst: 150
+  perKeyRps: 50
+  perKeyBurst: 100
+
+tts:
+  # tencent | ali | xunfei | mock
+  # mock：无需密钥，生成一段可播放的 WAV，供本地联调与冒烟测试；默认不启用。
+  provider: tencent
+  fallbackProvider: ""
+  credentials:                      # 仅服务端持有，绝不下发客户端
+    secretId: ${EZNEWS_TTS_SECRET_ID}
+    secretKey: ${EZNEWS_TTS_SECRET_KEY}
+    appId: ${EZNEWS_TTS_APP_ID}
+  defaultVoice: "101001"            # 腾讯云音色示例
+  defaultSpeed: 1.0
+  format: mp3
+  sampleRate: 16000
+  maxChars: 800
+  concurrency: 3
+  queueSize: 512
+  maxRetries: 3
+  timeout: 30s
+
+audio:
+  dir: ./data/audio
+  maxTotalBytes: 2147483648         # 2 GiB
+  maxAgeDays: 30
+  accessFlushIntervalSec: 60
+
+retention:
+  enabled: true
+  days: 90
+
+janitor:
+  intervalMin: 60
+
+search:
+  enableFts: true
+
+log:
+  level: info                       # debug | info | warn | error
+  format: json                      # slog JSON
